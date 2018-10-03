@@ -1,6 +1,6 @@
 # Flask Codegen
 
-Generate an entire project, based on templates
+Generate an entire project, based on database tables, using templates
 
 ## Requirements
 
@@ -11,7 +11,7 @@ Generate an entire project, based on templates
 
 ```
 python3 -m 'pip -r requirements.txt'
-sudo ln -s ${PWD}/flaskcodegen /usr/local/bin/flaskcodegen
+sudo ln -s $(pwd)/flaskcodegen /usr/local/bin/flaskcodegen
 mkdir -p <your project name>
 cd <your project name>
 flaskcodegen
