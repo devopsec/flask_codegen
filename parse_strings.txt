@@ -1,0 +1,182 @@
+# models.py
+class Callcenter(Base):
+    __tablename__ = 'callcenter'
+
+    id = Column(Integer, primary_key=True, unique=True)
+    name = Column(String(25))
+    description = Column(String(50))
+    sipaddr = Column(String(192))
+    default_priority = Column(Integer, server_default=text("'0'"))
+    status = Column(Integer, nullable=False, server_default=text("'0'"))
+
+
+class Dqueue(Base):
+    __tablename__ = 'dqueue'
+
+    id = Column(Integer, primary_key=True, unique=True)
+    name = Column(String(25))
+    callcenters = Column(JSON)
+    dnid = Column(String(25))
+    datetime = Column(DateTime)
+    status = Column(Integer, nullable=False, server_default=text("'0'"))
+
+
+class Queue2callcenter(Base):
+    __tablename__ = 'queue2callcenter'
+
+    id = Column(Integer, primary_key=True, unique=True)
+    dqueue_id = Column(Integer)
+    callcenter_id = Column(Integer)
+    priority = Column(Integer, server_default=text("'0'"))
+    status = Column(Integer, nullable=False, server_default=text("'0'"))
+
+
+# endpoints.py
+class ManageCallcenter(Resource):
+    def get(self, _callcenter_id_=None):  # get all info about a Callcenter #
+        try:
+            x = db.query(Callcenter).filter_by(id=_callcenter_id_).first()
+            _id = x.id
+            _name = x.name
+            _description = x.description
+            _sipaddr = x.sipaddr
+            _default_priority = x.default_priority
+            _status = x.status
+
+            if x != None:
+                return jsonify(
+                    code=200,
+                    message='Callcenter search success',
+                    id = _id,
+                    name = _name,
+                    description = _description,
+                    sipaddr = _sipaddr,
+                    default_priority = _default_priority,
+                    status = _status
+                )
+            else:
+                return {
+                    'code': 400,
+                    'message': 'Callcenter search failure'
+                }
+        except Exception as e:
+            return {
+                'code': 500,
+                'message': str(e)
+            }
+
+    def post(self, _callcenter_id_=None):  # create a new Callcenter #
+        try:
+            parser = reqparse.RequestParser()
+
+
+
+            args = parser.parse_args()
+
+            _id = args['id']
+            _name = args['name']
+            _description = args['description']
+            _sipaddr = args['sipaddr']
+            _default_priority = args['default_priority']
+            _status = args['status']
+
+            query = Callcenter(id=_id, name=_name, description=_description, sipaddr=_sipaddr, default_priority=_default_priority, status=_status)
+
+            try:
+                db.add(query)  # add prepared sipaddrment to opened session
+                db.commit()  # commit changes
+                return {
+                    'code': 200,
+                    'message': 'Callcenter creation successful'
+                }
+            except:
+                db.rollback()
+                db.flush()  # for resetting non-commited .add()
+                return {
+                    'status': 400,
+                    'code': 'Callcenter creation failure'
+                }
+        except Exception as e:
+            return {
+                'code': 500,
+                'message': str(e)
+            }
+
+    def put(self, _callcenter_id_=None):  # update a Callcenter's info #
+        try:
+            parser = reqparse.RequestParser()
+
+
+
+            args = parser.parse_args()
+
+            try:
+                x = db.query(Callcenter).filter_by(id=_callcenter_id_).first()  # fetch the name to be updated
+
+                if args['id'] != None:
+                    x.id = args['id']
+                if args['name'] != None:
+                    x.name = args['name']
+                if args['description'] != None:
+                    x.description = args['description']
+                if args['sipaddr'] != None:
+                    x.sipaddr = args['sipaddr']
+                if args['default_priority'] != None:
+                    x.default_priority = args['default_priority']
+                if args['status'] != None:
+                    x.status = args['status']
+
+                db.commit()  # commit changes
+
+                return {
+                    'code': 200,
+                    'message': 'Callcenter update successful'
+                }
+            except:
+                db.rollback()
+                db.flush()  # for resetting non-commited .add()
+                return {
+                    'code': 400,
+                    'message': 'Callcenter update failure'
+                }
+        except Exception as e:
+            return {
+                'code': 500,
+                'message': str(e)
+            }
+
+    def delete(self, _callcenter_id_=None):  # delete a Callcenter #
+        try:
+            x = db.query(Callcenter).filter_by(id=_callcenter_id_).first()
+            try:
+                db.session.delete(x)
+                db.session.commit()
+                return {
+                    'code': 200,
+                    'message': 'Callcenter delete successful'
+                }
+            except:
+                db.rollback()
+                db.flush()  # for resetting non-commited .add()
+                return {
+                    'code': 400,
+                    'message': 'Callcenter delete failure'
+                }
+        except Exception as e:
+            return {
+                'code': 500,
+                'message': str(e)
+            }
+
+
+# etc.......
+api.add_resource(ManageCallcenter, '/api/callcenter','/api/callcenter/<string:_callcenter_id_>', methods=['GET', 'PUT', 'POST', 'DELETE'], endpoint='callcenter')
+api.add_resource(ManageDqueue, '/api/dqueue','/api/dqueue/<string:_dqueue_id_>', methods=['GET', 'PUT', 'POST', 'DELETE'], endpoint='dqueue')
+api.add_resource(ManageQueue2callcenter, '/api/queue2callcenter','/api/queue2callcenter/<string:_queue2callcenter_id_>', methods=['GET', 'PUT', 'POST', 'DELETE'], endpoint='queue2callcenter')
+
+if __name__ == '__main__':
+    if not database_exists(engine.url):
+        create_database(engine.url)
+        Base.metadata.create_all(engine)
+    app.run(host='0.0.0.0', port=7777, debug=True)
+

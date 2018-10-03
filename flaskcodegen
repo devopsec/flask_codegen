@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+
+from decimal import Decimal
+from array import array
+from datetime import datetime, timedelta, tzinfo, timezone
+import re, os, argparse, subprocess, shutil, errno, sys, stat
+from sqlalchemy import inspect
+from util import *
+import sqlalchemy.types
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-d", "--database", type=str, help="database to dump", required=True)
+parser.add_argument("-p", "--projectdir", type=str, help="project directory to create", required=True)
+args = parser.parse_args()
+
+if args.database == None or args.database == "":
+    print("database argument is required")
+    exit(1)
+if args.projectdir == None or args.projectdir == "":
+    print("projectdir argument is required")
+    exit(1)
+
+# TODO: support various mysql dialects / db connectors, such as:
+# MySQL-Python, mysqlclient, PyMySQL, mysql-connector, cymysql, oursql
+# TODO: support dialects / db connectors other than mysql, such as:
+# Firebird, Microsoft SQL Server, MySQL, Oracle, PostgreSQL, SQLite, Sybase
+
+# define constants
+dbtype = 'mysql'
+dbuser = 'root'
+dbpass = ''
+dbhost = 'localhost'
+dbname = str(args.database)
+sqluri = dbtype + '://' + dbuser + ':' + dbpass + '@' + dbhost + '/' + dbname
+apiport = "7777"
+
+# define globals
+parsed_data = {}
+parsed_data['tables'] = []
+parsed_data['classes'] = []
+parsed_data['columns'] = []
+parsed_data['columntypes'] = []
+parsed_data['columnpythontypes'] = []
+parsed_data['tableprimarykeys'] = []
+parsed_data['tableprimarykeytypes'] = []
+parsed_str=""
+add_str = ""
+
+# grab output from sqlacodegen
+cmd = ["sqlacodegen", sqluri]
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+input_str, err = p.communicate()
+
+payloads_post = []
+payloads_put = []
+tests_str = "import requests\n\n"
+
+UTC = timezone.utc
+EST = timezone(-timedelta(hours=5))
+NOW = datetime.now(EST)
+FUTURE = datetime.now(UTC)
+
+tests = dict(
+    bool=True,
+    int=1,
+    float=float(1),
+    complex=complex(1),
+    Decimal=Decimal(1),
+    str="test str",
+    dict={"test": "dict"},
+    list=["test1", "test2", "test3"],
+    tuple=tuple(['test', 'tuple']),
+    map=map('test', 'map'),
+    range=range(3),
+    set={'test', 'set'},
+    frozenset=frozenset(['test', 'frozenset']),
+    json_dict={"test": [{"test": "nested"}, {"test": "nested"}, {"test": "nested"}]},
+    json_str='{"test": [{"test": "nested"}, {"test": "nested"}, {"test": "nested"}]}',
+    datetime=NOW,
+    date=NOW.date(),
+    time=NOW.time(),
+    timedelta=-timedelta(hours=5),
+    timezone=EST,
+    bytes=b'test',
+    bytearray=bytearray(b'test'),
+    memoryview=memoryview(b'test'),
+    Ellipsis=...,
+    object=object(),
+    enumerate=enumerate(['test', 'enumerate']),
+    slice=slice(1,5,2),
+    array=array('l',[0,1,2,3]),
+    NoneType=None
+)
+
+changed_tests = dict(
+    bool=False,
+    int=0,
+    float=float(10),
+    complex=complex(10),
+    Decimal=Decimal(10),
+    str="changed str",
+    dict={"changed": "dict"},
+    list=["changed1", "changed2", "changed3"],
+    tuple=tuple(['changed', 'tuple']),
+    map=map('changed', 'map'),
+    range=range(3),
+    set={'changed', 'set'},
+    frozenset=frozenset(['changed', 'frozenset']),
+    json_dict={"changed": [{"changed": "nested"}, {"changed": "nested"}, {"changed": "nested"}]},
+    json_str='{"changed": [{"changed": "nested"}, {"changed": "nested"}, {"changed": "nested"}]}',
+    datetime=FUTURE,
+    date=FUTURE.date(),
+    time=FUTURE.time(),
+    timedelta=timedelta(hours=0),
+    timezone=UTC,
+    bytes=b'changed',
+    bytearray=bytearray(b'changed'),
+    memoryview=memoryview(b'changed'),
+    Ellipsis=...,
+    object=object(),
+    enumerate=enumerate(['changed', 'enumerate']),
+    slice=slice(1,5,2),
+    array=array('l',[0,1,2,3]),
+    NoneType=None
+)
+
+
+# Create mapping of sqla types --> python types
+# arg = None
+# type_conversions = {}
+# for sqltype in sqlalchemy.types.__all__:
+#     cmd = 'arg = sqlalchemy.types.{}()'.format(sqltype)
+#     try:
+#         exec(cmd)
+#         type_conversions[sqltype] = arg.python_type.__name__
+#     except Exception:
+#         if sqltype == 'TypeEngine' or 'TypeDecorator' or 'UserDefinedType':
+#             continue
+#         elif sqltype == 'Concatenable':
+#             type_conversions[sqltype] = 'str'
+#         elif sqltype == 'PickleType':
+#             type_conversions[sqltype] = 'bytes'
+#         elif sqltype == 'Indexable':
+#             type_conversions[sqltype] = 'json_encode'
+#         elif sqltype == 'ARRAY':
+#             type_conversions[sqltype] = 'array'
+# DEBUG:
+# for k,v in type_conversions.items():
+#     print('{}: {}'.format(k,v))
+
+
+def unpackcol_test_payload(reqtype, args, types):
+    i = 0
+    add = None
+    json_dict = {}
+    if reqtype == 'POST': 
+        if len(args) == 1:
+            if types[0] in list(tests):
+                if types[0] == 'dict':
+                    if isjson_dict(args[0]):
+                        add = tests['json_dict']
+                    else:
+                        add = tests['dict']
+                elif types[0] == 'str':
+                    if isjson_str(args[0]):
+                        add = tests['json_str']
+                    else:
+                        add = tests['str']
+                else:
+                    add = tests[types[0]]
+            json_dict[args[i]] = add
+        else:
+            while(i < len(args)):
+                if types[i] == 'dict':
+                    if isjson_dict(args[i]):
+                        add = tests['json_dict']
+                    else:
+                        add = tests['dict']
+                elif types[i] == 'str':
+                    if isjson_str(args[i]):
+                        add = tests['json_str']
+                    else:
+                        add = tests['str']
+                else:
+                    add = tests[types[i]]
+                json_dict[args[i]] = add
+                
+                i += 1
+
+    elif reqtype == 'PUT':
+        if len(args) == 1:
+            if types[0] in list(tests):
+                if types[0] == 'dict':
+                    if isjson_dict(args[0]):
+                        add = changed_tests['json_dict']
+                    else:
+                        add = changed_tests['dict']
+                elif types[0] == 'str':
+                    if isjson_str(args[0]):
+                        add = changed_tests['json_str']
+                    else:
+                        add = changed_tests['str']
+                else:
+                    add = changed_tests[types[0]]
+            json_dict[args[i]] = add
+        else:
+            while (i < len(args)):
+                if types[i] == 'dict':
+                    if isjson_dict(args[i]):
+                        add = changed_tests['json_dict']
+                    else:
+                        add = changed_tests['dict']
+                elif types[i] == 'str':
+                    if isjson_str(args[i]):
+                        add = changed_tests['json_str']
+                    else:
+                        add = changed_tests['str']
+                else:
+                    add = changed_tests[types[i]]
+                json_dict[args[i]] = add
+
+                i += 1
+
+    # Debug:
+    # print(json_encode(json_dict, cls=AlchemyEncoder))
+
+    return json_encode(json_dict, cls=AlchemyEncoder)
+
+
+def unpackcol_get(args):
+    i = 0
+    string = ""
+    while(i < len(args)):
+        if i != len(args)-1:
+            string += '{arg}=res.{arg},\n                    '.format(arg=args[i])
+        else:
+            string += '{arg}=res.{arg}'.format(arg=args[i])
+        i += 1
+    return string
+
+def unpackcol_parse(table, args, types):
+    i = 0
+    string = ""
+    while(i < len(args)):
+        # special case parsing
+        if types[i] == 'datetime':
+            _type = 'datetime_decode'
+        elif types[i] == 'date':
+            _type = 'date_decode'
+        elif types[i] == 'time':
+            _type = 'time_decode'
+        elif isjson_str(args[i]):
+            _type = 'json_decode'
+        else:
+            _type = types[i]
+
+        if i != len(args)-1:
+            string += "parser.add_argument('{arg}', type={type}, help='{arg} column of {table} table', location='json')\n            ".format(arg=args[i], type=_type, table=table)
+        else:
+            string += "parser.add_argument('{arg}', type={type}, help='{arg} column of {table} table', location='json')".format(arg=args[i], type=_type, table=table)
+        i += 1
+    return string
+
+def unpackcol_post(args, types):
+    i = 0
+    string = ""
+    while(i < len(args)):
+        if i != len(args)-1:
+            string += "if args['{arg}'] is not None:\n                ".format(arg=args[i])
+            string += "query.{arg} = args['{arg}']\n            ".format(arg=args[i])
+        else:
+            string += "if args['{arg}'] is not None:\n                ".format(arg=args[i])
+            string += "query.{arg} = args['{arg}']            ".format(arg=args[i])
+
+        i += 1
+    return string
+
+def unpackcol_put(args, types):
+    i = 0
+    string = ""
+    while(i < len(args)):
+        if i != len(args)-1:
+            string += "if args['{arg}'] is not None:\n                    ".format(arg=args[i])
+            string += "res.{arg} = args['{arg}']\n                ".format(arg=args[i])
+        else:
+            string += "if args['{arg}'] is not None:\n                    ".format(arg=args[i])
+            string += "res.{arg} = args['{arg}']".format(arg=args[i])
+        i += 1
+    return string
+
+
+### start parsing models into one data structure
+
+# grab metadata and Base by executing output from sqlacodegen
+env = dict(locals(), **globals())
+exec(input_str, env, env)
+
+# grab table, column names and column types
+for t in env['metadata'].sorted_tables:
+    column_list = []
+    columntype_list = []
+    columnpythontype_list = []
+    parsed_data['tables'].append(t.name)
+    parsed_data['classes'].append(get_class_by_tablename(t.name, env['Base']).__name__)
+    # TODO: find better way to identify for multiple primary keys
+    parsed_data['tableprimarykeys'].append(t.primary_key.columns.values()[0].name)
+    parsed_data['tableprimarykeytypes'].append(t.primary_key.columns.values()[0].type.python_type.__name__)
+    for col, ormcol in zip(t.columns, inspect(get_class_by_tablename(t.name, env['Base'])).attrs):
+        column_list.append(ormcol.key)
+        columntype_list.append(col.type.__str__())
+        columnpythontype_list.append(col.type.python_type.__name__)
+
+    parsed_data['columns'].append(column_list)
+    parsed_data['columntypes'].append(columntype_list)
+    parsed_data['columnpythontypes'].append(columnpythontype_list)
+
+numoftables = len(parsed_data['tables'])
+
+
+# TODO: no support for relationships or foreign keys
+# fix data types that can't be converted
+for l in parsed_data['columntypes']:
+    l[:] = [x for x in l if x  != 'ForeignKey' and x != 'relationship']
+
+parsed_str += """
+def debug_endpoint(*args):
+    if (settings.ENV == "DEV"):
+        print("\\n")
+        if args:
+            for arg in args:
+                ColorPrint.inf(arg)
+        if request.args:
+            ColorPrint.inf(request.args.__str__())
+        if request.headers:
+            ColorPrint.inf(request.headers.__str__())
+        if request.data:
+            ColorPrint.inf(request.data.__str__())
+        if request.files:
+            ColorPrint.inf(request.files.__str__())
+        if request.form:
+            ColorPrint.inf(request.form.__str__())
+        if request.json:
+            ColorPrint.inf(request.json.__str__())
+        if request.values:
+            ColorPrint.inf(request.values.__str__())
+        print("\\n")
+"""
+
+i = 0
+while i < numoftables:
+    parsed_str += """
+class Manage{table}(Resource):
+    def get(self, {id}=None):  # get all info about a {table} #
+        debug_endpoint()
+        try:
+            res = db.query({_class}).filter_by({id_column}={id}).first()
+
+            if res is not None:
+                return jsonify(
+                    return_code=200,
+                    message='{table} {{parent_func}} successful'.format(parent_func=sys._getframe().f_code.co_name.upper()),
+                    {cols1}
+                )
+            else:
+                return jsonify(
+                    return_code=400,
+                    return_message='{table} {{parent_func}} failure'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+        except Exception as e:
+            print_exception()
+            return jsonify(
+                return_code=500,
+                return_message=str(e)
+            )
+
+    def post(self, {id}=None):  # create a new {table} #
+        debug_endpoint()
+        try:
+            parser = reqparse.RequestParser()
+
+            {cols2}
+
+            args = parser.parse_args()
+            
+            query = {_class}()
+            
+            {cols3}
+            
+            try:
+                db.add(query)  # add prepared sipaddrment to opened session
+                db.commit()  # commit changes
+                return jsonify(
+                    return_code=200,
+                    return_message='{table} {{parent_func}} successful'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+            except:
+                print_exception()
+                db.rollback()
+                db.flush()  # for resetting non-commited .add()
+                return jsonify(
+                    return_code=400,
+                    return_message='{table} {{parent_func}} failure'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+        except Exception as e:
+            print_exception()
+            return jsonify(
+                return_code=500,
+                return_message=str(e)
+            )
+
+    def put(self, {id}=None):  # update a {table}'s info #
+        debug_endpoint()
+        try:
+            parser = reqparse.RequestParser()
+
+            {cols4}
+
+            args = parser.parse_args()
+
+            try:
+                res = db.query({_class}).filter_by({id_column}={id}).first()  # fetch the name to be updated
+
+                {cols5}
+
+                db.commit()  # commit changes
+
+                return jsonify(
+                    return_code=200,
+                    return_message='{table} {{parent_func}} successful'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+            except:
+                print_exception()
+                db.rollback()
+                db.flush()  # for resetting non-commited .add()
+                return jsonify(
+                    return_code=400,
+                    return_message='{table} {{parent_func}} failure'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+        except Exception as e:
+            print_exception()
+            return jsonify(
+                return_code=500,
+                return_message=str(e)
+            )
+
+    def delete(self, {id}=None):  # delete a {table} #
+        debug_endpoint()
+        try:
+            res = db.query({_class}).filter_by({id_column}={id}).first()
+            try:
+                db.delete(res)
+                db.commit()
+                return jsonify(
+                    return_code=200,
+                    return_message='{table} {{parent_func}} successful'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+            except:
+                print_exception()
+                db.rollback()
+                db.flush()  # for resetting non-commited .add()
+                return jsonify(
+                    return_code=400,
+                    return_message='{table} {{parent_func}} failure'.format(parent_func=sys._getframe().f_code.co_name.upper())
+                )
+        except Exception as e:
+            print_exception()
+            return jsonify(
+                return_code=500,
+                return_message=str(e)
+            )
+
+""".format(
+    table=parsed_data['tables'][i],
+    _class=parsed_data['classes'][i],
+    id_column=parsed_data['tableprimarykeys'][i],
+    id='_{primary_key}_'.format(primary_key=parsed_data['tableprimarykeys'][i]),
+    cols1=unpackcol_get(parsed_data['columns'][i]),
+    cols2=unpackcol_parse(parsed_data['tables'][i], parsed_data['columns'][i], parsed_data['columnpythontypes'][i]),
+    cols3=unpackcol_post(parsed_data['columns'][i], parsed_data['columnpythontypes'][i]),
+    cols4=unpackcol_parse(parsed_data['tables'][i], parsed_data['columns'][i], parsed_data['columnpythontypes'][i]),
+    cols5=unpackcol_put(parsed_data['columns'][i], parsed_data['columnpythontypes'][i])
+)
+
+    add_str += "api.add_resource(Manage{table}, '/api/{tablename}','/api/{tablename}/<{id_type}:{id}>', methods=['GET', 'PUT', 'POST', 'DELETE'], endpoint='{tablename}')\n".format(
+        table=parsed_data['tables'][i],
+        tablename=parsed_data['tables'][i].lower(),
+        id_type=parsed_data['tableprimarykeytypes'][i],
+        id='_{primary_key}_'.format(primary_key=parsed_data['tableprimarykeys'][i])
+    )
+    i += 1
+
+regex = r"# coding: utf-8(.+?\r?\n?)?(?=class)"
+replace_str = """# coding: utf-8
+import os, sys
+from flask import Flask, jsonify, request
+from flask_cors import CORS, cross_origin
+from flask_restful import Api, Resource, reqparse, fields
+from sqlalchemy import create_engine, Column, DateTime, Integer, String, text, JSON
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy_utils import database_exists, create_database
+
+# Minimal Flask API setup
+app = Flask(__name__)
+app.secret_key = 'not_for_production'
+Base = declarative_base()
+metadata = Base.metadata
+sqluri = 'mysql://root@localhost/mysql'
+engine = create_engine(sqluri, echo=False, pool_recycle=10)
+Session = sessionmaker(bind=engine)
+db = Session()
+api= Api(app)
+CORS(app)
+
+""".format(sqluri=sqluri)
+input_str =  re.sub(regex, replace_str, input_str, flags=re.MULTILINE|re.DOTALL)
+
+add_str += """
+
+if __name__ == '__main__':
+    if not database_exists(engine.url):
+        create_database(engine.url)
+        Base.metadata.create_all(engine)
+    app.run(host='0.0.0.0', port={apiport}, debug=True)
+""".format(apiport=apiport)
+
+
+
+i = 0
+while i < numoftables:
+
+    payloads_post.append(unpackcol_test_payload(reqtype="POST", args=parsed_data['columns'][i], types=parsed_data['columnpythontypes'][i]))
+    payloads_put.append(unpackcol_test_payload(reqtype="PUT", args=parsed_data['columns'][i], types=parsed_data['columnpythontypes'][i]))
+
+    tests_str += """
+url = "http://localhost:{apiport}/api/{tablename}"
+payload = {post}
+headers = {{
+    'accept': "application/json",
+    'accept-encoding': "gzip, deflate, br",
+    'content-type': "application/json",
+    'cache-control': "no-cache"
+}}
+response = requests.request("POST", url, data=payload, headers=headers)
+print(response.text)
+
+url = "http://localhost:{apiport}/api/{tablename}/1"
+headers = {{
+    'accept': "application/json",
+    'accept-encoding': "gzip, deflate, br",
+    'content-type': "application/json",
+    'cache-control': "no-cache"
+}}
+response = requests.request("GET", url, headers=headers)
+print(response.text)
+
+url = "http://localhost:{apiport}/api/{tablename}/1"
+payload = {put}
+headers = {{
+    'accept': "application/json",
+    'accept-encoding': "gzip, deflate, br",
+    'content-type': "application/json",
+    'cache-control': "no-cache"
+}}
+response = requests.request("PUT", url, data=payload, headers=headers)
+print(response.text)
+
+url = "http://localhost:{apiport}/api/{tablename}/1"
+headers = {{
+    'accept': "application/json",
+    'accept-encoding': "gzip, deflate, br",
+    'content-type': "application/json",
+    'cache-control': "no-cache"
+}}
+response = requests.request("DELETE", url, headers=headers)
+print(response.text)
+
+""".format(
+        apiport=apiport,
+        tablename=parsed_data['tables'][i].lower(),
+        post=json_encode(payloads_post[i]),
+        put=json_encode(payloads_put[i])
+    )
+    i += 1
+
+# TODO: autogen a GUI and project structure
+# create project structure
+def touch(path):
+    with open(path, 'a'):
+        os.utime(path, None)
+
+def mkdir(path, mode=0o777):
+    if not os.path.exists(path):
+        os.makedirs(path, mode)
+
+def cp(src, dst, symlinks=False, ignore=None, ignore_dangling_symlinks=False):
+    if os.path.isfile(src):
+        shutil.copy2(src, dst)
+
+    else:
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        try:
+            shutil.copytree(src, dst, symlinks=symlinks, ignore=ignore, ignore_dangling_symlinks=ignore_dangling_symlinks)
+        except OSError as e:
+            if e.errno == errno.ENOTDIR:
+                if not os.path.exists(dst):
+                    shutil.copy(src, dst)
+            else:
+                raise
+
+cwd = os.getcwd()
+projdir = args.projectdir
+mkdir(projdir)
+
+mkdir(os.path.join(projdir,"api"))
+touch(os.path.join(projdir,"api","__init__.py"))
+touch(os.path.join(projdir,"api","rest_server.py"))
+touch(os.path.join(projdir,"api","auth.py"))
+mkdir(os.path.join(projdir,"api","uploads"))
+mkdir(os.path.join(projdir,"api","uploads","audio"))
+mkdir(os.path.join(projdir,"api","uploads","docs"))
+mkdir(os.path.join(projdir,"api","uploads","images"))
+mkdir(os.path.join(projdir,"api","uploads","videos"))
+mkdir(os.path.join(projdir,"gui"))
+touch(os.path.join(projdir,"gui","__init__.py"))
+touch(os.path.join(projdir,"gui","gui_server.py"))
+touch(os.path.join(projdir,"gui","views.py"))
+touch(os.path.join(projdir,"gui","forms.py"))
+mkdir(os.path.join(projdir,"gui","static"))
+mkdir(os.path.join(projdir,"gui","static","js"))
+mkdir(os.path.join(projdir,"gui","static","css"))
+mkdir(os.path.join(projdir,"gui","static","img"))
+touch(os.path.join(projdir,"gui","static","css","styles.css"))
+mkdir(os.path.join(projdir,"gui","templates"))
+touch(os.path.join(projdir,"gui","templates","layout.html"))
+touch(os.path.join(projdir,"gui","templates","index.html"))
+touch(os.path.join(projdir,"gui","templates","login.html"))
+touch(os.path.join(projdir,"gui","templates","register.html"))
+touch(os.path.join(projdir,"gui","templates","404.html"))
+mkdir(os.path.join(projdir,"gui","uploads"))
+mkdir(os.path.join(projdir,"gui","uploads","audio"))
+mkdir(os.path.join(projdir,"gui","uploads","docs"))
+mkdir(os.path.join(projdir,"gui","uploads","images"))
+mkdir(os.path.join(projdir,"gui","uploads","videos"))
+mkdir(os.path.join(projdir,"database"))
+touch(os.path.join(projdir,"database","__init__.py"))
+touch(os.path.join(projdir,"database","models.py"))
+mkdir(os.path.join(projdir,"testing"))
+touch(os.path.join(projdir,"testing","__init__.py"))
+mkdir(os.path.join(projdir,"util"))
+touch(os.path.join(projdir,"util","__init__.py"))
+mkdir(os.path.join(projdir,"build"))
+touch(os.path.join(projdir,"build", "build.sh"))
+touch(os.path.join(projdir,"build", "Dockerfile.gui"))
+touch(os.path.join(projdir,"build", "Dockerfile.rest"))
+touch(os.path.join(projdir,"build", "build.sh"))
+touch(os.path.join(projdir,"run.py"))
+touch(os.path.join(projdir,"config.py"))
+touch(os.path.join(projdir,"README.md"))
+touch(os.path.join(projdir,"CONTRIBUTING.md"))
+touch(os.path.join(projdir,"LICENSE"))
+
+cp(os.path.join(cwd,"files"), os.path.join(projdir,"files"))
+
+
+# TODO: seperate each module independently
+# create endpoints
+with open(os.path.join(projdir,"api","endpoints.py"), 'w+') as sys.stdout:
+    # imports
+    print(input_str, flush=True)
+    # endpoints
+    print(parsed_str, flush=True)
+    # independent run
+    print(add_str, flush=True)
+
+# create endpoint tests
+with open(os.path.join(projdir,"testing","test_endpoints.py"), 'w+') as sys.stdout:
+    # request testing
+    print(tests_str, flush=True)
+
+# dump a backup of database tables
+with open(os.path.join(projdir,"database","createdb.sql"), 'w+') as f:
+    cmd = ["mysqldump", "--databases", "--no-data", "--single-transaction", "--user={}".format(dbuser), dbname]
+    p = subprocess.Popen(cmd, stdout=f, universal_newlines=True)
+    p.wait()
+
+# create requirements.txt
+with open(os.path.join(projdir,"build","requirements.txt"), 'w+') as f:
+    cmd = ["pipreqs", cwd, "--force"]
+    p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.DEVNULL, universal_newlines=True)
+    p.wait()
